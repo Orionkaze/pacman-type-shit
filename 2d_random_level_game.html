@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #0a0a0f; font-family: var(--font-sans, monospace); overflow: hidden; }
+canvas { display: block; }
+#ui { position: absolute; top: 10px; left: 10px; color: #fff; font-size: 13px; pointer-events: none; }
+#ui .badge { display: inline-block; background: rgba(255,255,255,0.1); border: 0.5px solid rgba(255,255,255,0.2); padding: 4px 10px; border-radius: 20px; margin-right: 6px; font-size: 12px; }
+#ui .badge.hp { background: rgba(220,50,50,0.25); border-color: rgba(220,50,50,0.5); }
+#ui .badge.coin { background: rgba(255,200,0,0.2); border-color: rgba(255,200,0,0.4); }
+#ui .badge.lvl { background: rgba(100,150,255,0.2); border-color: rgba(100,150,255,0.4); }
+#controls { position: absolute; bottom: 10px; left: 0; right: 0; text-align: center; color: rgba(255,255,255,0.4); font-size: 11px; pointer-events: none; }
+#overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: rgba(0,0,0,0.85); }
+#overlay h1 { color: #fff; font-size: 28px; font-weight: 500; margin-bottom: 8px; }
+#overlay p { color: rgba(255,255,255,0.5); font-size: 13px; margin-bottom: 24px; }
+.btn { background: transparent; border: 0.5px solid rgba(255,255,255,0.3); color: #fff; padding: 10px 28px; border-radius: 8px; font-size: 14px; cursor: pointer; margin: 0 6px; transition: background 0.15s; }
+.btn:hover { background: rgba(255,255,255,0.1); }
+.btn.primary { border-color: rgba(100,150,255,0.7); color: #8ab4ff; }
+.btn.primary:hover { background: rgba(100,150,255,0.15); }
+#minimap { position: absolute; top: 10px; right: 10px; border: 0.5px solid rgba(255,255,255,0.2); border-radius: 6px; overflow: hidden; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<canvas id="minimap" width="120" height="120"></canvas>
+<div id="ui">
+  <span class="badge lvl" id="lvlbadge">Level 1</span>
+  <span class="badge hp" id="hpbadge">❤ 3</span>
+  <span class="badge coin" id="coinbadge">⬟ 0</span>
+  <span class="badge" id="roombadge">Room 1/?</span>
+</div>
+<div id="controls">WASD / Arrow Keys to move · Collect gems · Reach the exit ⬡ · R = new level</div>
+<div id="overlay">
+  <h1>🗺 Random Dungeon</h1>
+  <p>Solo or Co-op · Every run is different</p>
+  <div>
+    <button class="btn primary" onclick="startGame(1)">Solo Run</button>
+    <button class="btn" onclick="startGame(2)">2 Players (same keyboard)</button>
+  </div>
+</div>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const mm = document.getElementById('minimap').getContext('2d');
+
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+
+const TILE = 32;
+const COLS = Math.floor(canvas.width / TILE);
+const ROWS = Math.floor(canvas.height / TILE);
+
+let state = null;
+let overlay = document.getElementById('overlay');
+let animId;
+
+// ─── Dungeon Gen ───────────────────────────────────────────────
+function makeMap() {
+  const map = Array.from({length: ROWS}, () => Array(COLS).fill(1));
+  const rooms = [];
+  const tries = 60;
+  for (let t = 0; t < tries; t++) {
+    const rw = 5 + Math.floor(Math.random() * 6);
+    const rh = 4 + Math.floor(Math.random() * 5);
+    const rx = 1 + Math.floor(Math.random() * (COLS - rw - 2));
+    const ry = 1 + Math.floor(Math.random() * (ROWS - rh - 2));
+    let ok = true;
+    for (const r of rooms) {
+      if (rx < r.x+r.w+2 && rx+rw+2 > r.x && ry < r.y+r.h+2 && ry+rh+2 > r.y) { ok = false; break; }
+    }
+    if (!ok) continue;
+    rooms.push({x:rx, y:ry, w:rw, h:rh});
+    for (let y = ry; y < ry+rh; y++) for (let x = rx; x < rx+rw; x++) map[y][x] = 0;
+  }
+  // carve corridors
+  for (let i = 1; i < rooms.length; i++) {
+    const a = rooms[i-1], b = rooms[i];
+    const ax = a.x + Math.floor(a.w/2), ay = a.y + Math.floor(a.h/2);
+    const bx = b.x + Math.floor(b.w/2), by = b.y + Math.floor(b.h/2);
+    let cx = ax, cy = ay;
+    while (cx !== bx) { map[cy][cx] = 0; cx += cx < bx ? 1 : -1; }
+    while (cy !== by) { map[cy][cx] = 0; cy += cy < by ? 1 : -1; }
+  }
+  return {map, rooms};
+}
+
+function randomFloor(map) {
+  while (true) {
+    const x = 1 + Math.floor(Math.random() * (COLS-2));
+    const y = 1 + Math.floor(Math.random() * (ROWS-2));
+    if (map[y][x] === 0) return {x, y};
+  }
+}
+
+// ─── Game State ────────────────────────────────────────────────
+function newLevel(level, numPlayers, prevCoins) {
+  const {map, rooms} = makeMap();
+  const spawnRoom = rooms[0];
+  const exitRoom = rooms[rooms.length-1];
+  const exit = {x: exitRoom.x + Math.floor(exitRoom.w/2), y: exitRoom.y + Math.floor(exitRoom.h/2)};
+
+  const p1Start = {x: spawnRoom.x+1, y: spawnRoom.y+1};
+  const p2Start = {x: spawnRoom.x+2, y: spawnRoom.y+1};
+
+  const players = [
+    {x: p1Start.x*TILE+4, y: p1Start.y*TILE+4, vx:0, vy:0, hp:3, maxHp:3, coins: prevCoins || 0,
+     color:'#7eb8ff', keys:{up:'ArrowUp',down:'ArrowDown',left:'ArrowLeft',right:'ArrowRight'}, invince:0, alive:true},
+  ];
+  if (numPlayers === 2) {
+    players.push({x: p2Start.x*TILE+4, y: p2Start.y*TILE+4, vx:0, vy:0, hp:3, maxHp:3, coins: 0,
+      color:'#f09090', keys:{up:'w',down:'s',left:'a',right:'d'}, invince:0, alive:true});
+  }
+
+  // gems
+  const gems = [];
+  for (let i = 0; i < 8 + level*2; i++) {
+    const pos = randomFloor(map);
+    gems.push({...pos, collected: false, color: Math.random()<0.3 ? '#ff6ec7' : Math.random()<0.5 ? '#ffe066' : '#66ffcc'});
+  }
+
+  // enemies
+  const enemies = [];
+  for (let i = 0; i < 3 + level; i++) {
+    const pos = randomFloor(map);
+    // keep away from spawn
+    if (Math.abs(pos.x - p1Start.x) < 4 && Math.abs(pos.y - p1Start.y) < 4) continue;
+    enemies.push({x: pos.x*TILE+4, y: pos.y*TILE+4, vx: (Math.random()<0.5?1:-1)*0.8, vy:0,
+      color:'#ff7043', hp:2, maxHp:2, type: i%3});
+  }
+
+  return {map, players, gems, enemies, exit, level, numPlayers, tick:0, gameOver:false, won:false, totalRooms: rooms.length};
+}
+
+let S = null;
+const keys = {};
+document.addEventListener('keydown', e => {
+  keys[e.key] = true;
+  if (e.key === 'r' || e.key === 'R') {
+    if (S) { S = newLevel(S.level, S.numPlayers, S.players[0].coins); }
+  }
+  e.preventDefault();
+}, {passive:false});
+document.addEventListener('keyup', e => { keys[e.key] = false; });
+
+function startGame(n) {
+  overlay.style.display = 'none';
+  S = newLevel(1, n, 0);
+  cancelAnimationFrame(animId);
+  loop();
+}
+
+// ─── Physics ───────────────────────────────────────────────────
+function solid(map, px, py, w, h) {
+  const x1 = Math.floor(px/TILE), y1 = Math.floor(py/TILE);
+  const x2 = Math.floor((px+w-1)/TILE), y2 = Math.floor((py+h-1)/TILE);
+  for (let y = y1; y <= y2; y++) for (let x = x1; x <= x2; x++) {
+    if (!map[y] || !map[y][x] === undefined || map[y][x] === 1) return true;
+    if (map[y] && map[y][x] === 1) return true;
+  }
+  return false;
+}
+
+const SPD = 2.2;
+function updatePlayer(p, map) {
+  if (!p.alive) return;
+  if (p.invince > 0) p.invince--;
+  p.vx = 0; p.vy = 0;
+  if (keys[p.keys.left])  p.vx = -SPD;
+  if (keys[p.keys.right]) p.vx = SPD;
+  if (keys[p.keys.up])    p.vy = -SPD;
+  if (keys[p.keys.down])  p.vy = SPD;
+  // normalize diagonal
+  if (p.vx && p.vy) { p.vx *= 0.707; p.vy *= 0.707; }
+  const nx = p.x + p.vx, ny = p.y + p.vy;
+  if (!solid(map, nx, p.y, 24, 24)) p.x = nx;
+  if (!solid(map, p.x, ny, 24, 24)) p.y = ny;
+  // clamp
+  p.x = Math.max(0, Math.min(p.x, COLS*TILE-24));
+  p.y = Math.max(0, Math.min(p.y, ROWS*TILE-24));
+}
+
+function updateEnemy(e, map, players) {
+  // pick nearest player
+  let target = players.find(p=>p.alive);
+  if (!target) return;
+  let best = Infinity;
+  for (const p of players) { if (!p.alive) continue; const d = Math.hypot(p.x-e.x,p.y-e.y); if(d<best){best=d;target=p;} }
+  const dx = target.x - e.x, dy = target.y - e.y;
+  const d = Math.hypot(dx,dy) || 1;
+  const spd = 0.7 + e.type * 0.3;
+  const nx = e.x + dx/d*spd, ny = e.y + dy/d*spd;
+  if (!solid(map, nx, e.y, 24, 24)) e.x = nx;
+  if (!solid(map, e.x, ny, 24, 24)) e.y = ny;
+}
+
+// ─── Update ────────────────────────────────────────────────────
+function update() {
+  if (!S || S.gameOver || S.won) return;
+  S.tick++;
+  for (const p of S.players) updatePlayer(p, S.map);
+  for (const e of S.enemies) updateEnemy(e, S.map, S.players);
+
+  // gem collection
+  for (const g of S.gems) {
+    if (g.collected) continue;
+    for (const p of S.players) {
+      if (!p.alive) continue;
+      if (Math.abs(p.x - g.x*TILE) < 28 && Math.abs(p.y - g.y*TILE) < 28) {
+        g.collected = true; p.coins++;
+      }
+    }
+  }
+
+  // player-enemy collision
+  for (const e of S.enemies) {
+    for (const p of S.players) {
+      if (!p.alive || p.invince > 0) continue;
+      if (Math.abs(p.x - e.x) < 24 && Math.abs(p.y - e.y) < 24) {
+        p.hp--; p.invince = 60;
+        if (p.hp <= 0) p.alive = false;
+      }
+    }
+  }
+
+  // exit check
+  for (const p of S.players) {
+    if (!p.alive) continue;
+    if (Math.abs(p.x - S.exit.x*TILE) < 28 && Math.abs(p.y - S.exit.y*TILE) < 28) {
+      // next level!
+      const coins = S.players.reduce((a,p)=>a+p.coins,0);
+      S = newLevel(S.level+1, S.numPlayers, coins);
+      return;
+    }
+  }
+
+  // all dead?
+  if (S.players.every(p=>!p.alive)) S.gameOver = true;
+
+  updateUI();
+}
+
+function updateUI() {
+  const p1 = S.players[0];
+  document.getElementById('lvlbadge').textContent = `Level ${S.level}`;
+  document.getElementById('hpbadge').textContent = '❤ '.repeat(p1.hp) || '💀';
+  document.getElementById('coinbadge').textContent = `⬟ ${S.players.reduce((a,p)=>a+p.coins,0)}`;
+}
+
+// ─── Draw ──────────────────────────────────────────────────────
+const WALL_COLOR = '#1a1a2e';
+const FLOOR_COLOR = '#12122a';
+const FLOOR2 = '#141428';
+
+function draw() {
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  if (!S) return;
+
+  // camera: center on p1
+  const p1 = S.players.find(p=>p.alive) || S.players[0];
+  const camX = Math.round(p1.x + 12 - canvas.width/2);
+  const camY = Math.round(p1.y + 12 - canvas.height/2);
+
+  ctx.save();
+  ctx.translate(-camX, -camY);
+
+  // tiles
+  const x0 = Math.max(0, Math.floor(camX/TILE));
+  const x1 = Math.min(COLS, Math.ceil((camX+canvas.width)/TILE));
+  const y0 = Math.max(0, Math.floor(camY/TILE));
+  const y1 = Math.min(ROWS, Math.ceil((camY+canvas.height)/TILE));
+
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      const tx = x*TILE, ty = y*TILE;
+      if (S.map[y][x] === 1) {
+        ctx.fillStyle = WALL_COLOR;
+        ctx.fillRect(tx, ty, TILE, TILE);
+        // subtle top highlight
+        ctx.fillStyle = 'rgba(255,255,255,0.03)';
+        ctx.fillRect(tx, ty, TILE, 3);
+      } else {
+        ctx.fillStyle = (x+y)%2===0 ? FLOOR_COLOR : FLOOR2;
+        ctx.fillRect(tx, ty, TILE, TILE);
+      }
+    }
+  }
+
+  // exit portal
+  const ex = S.exit.x*TILE, ey = S.exit.y*TILE;
+  const pulse = 0.7 + 0.3*Math.sin(S.tick*0.08);
+  ctx.save();
+  ctx.globalAlpha = pulse;
+  ctx.fillStyle = '#4af';
+  ctx.beginPath();
+  ctx.arc(ex+16, ey+16, 14*pulse, 0, Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle = '#fff';
+  ctx.font = '18px monospace';
+  ctx.fillText('⬡', ex+6, ey+22);
+  ctx.restore();
+
+  // gems
+  for (const g of S.gems) {
+    if (g.collected) continue;
+    const bob = Math.sin(S.tick*0.1 + g.x)*2;
+    ctx.fillStyle = g.color;
+    ctx.beginPath();
+    ctx.arc(g.x*TILE+16, g.y*TILE+14+bob, 6, 0, Math.PI*2);
+    ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.beginPath();
+    ctx.arc(g.x*TILE+14, g.y*TILE+12+bob, 2, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // enemies
+  for (const e of S.enemies) {
+    ctx.save();
+    ctx.fillStyle = e.color;
+    ctx.beginPath();
+    ctx.arc(e.x+12, e.y+12, 11, 0, Math.PI*2);
+    ctx.fill();
+    // eyes
+    ctx.fillStyle = '#fff';
+    ctx.beginPath(); ctx.arc(e.x+8, e.y+9, 3, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(e.x+16, e.y+9, 3, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#111';
+    ctx.beginPath(); ctx.arc(e.x+9, e.y+10, 1.5, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(e.x+17, e.y+10, 1.5, 0, Math.PI*2); ctx.fill();
+    // hp bar
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(e.x, e.y-8, 24, 4);
+    ctx.fillStyle = '#ff4444';
+    ctx.fillRect(e.x, e.y-8, 24*(e.hp/e.maxHp), 4);
+    ctx.restore();
+  }
+
+  // players
+  for (let i = 0; i < S.players.length; i++) {
+    const p = S.players[i];
+    if (!p.alive) continue;
+    ctx.save();
+    if (p.invince > 0 && Math.floor(p.invince/4)%2===0) { ctx.globalAlpha = 0.4; }
+    ctx.fillStyle = p.color;
+    // body
+    ctx.beginPath();
+    ctx.roundRect(p.x, p.y, 24, 24, 6);
+    ctx.fill();
+    // face
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.beginPath(); ctx.arc(p.x+8, p.y+9, 3, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(p.x+16, p.y+9, 3, 0, Math.PI*2); ctx.fill();
+    // P1/P2 tag
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 9px monospace';
+    ctx.fillText(`P${i+1}`, p.x+5, p.y+22);
+    // hp dots
+    for (let h = 0; h < p.maxHp; h++) {
+      ctx.fillStyle = h < p.hp ? '#ff4466' : 'rgba(255,255,255,0.2)';
+      ctx.beginPath(); ctx.arc(p.x+5+h*8, p.y-7, 3, 0, Math.PI*2); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  ctx.restore(); // camera
+
+  // game over / win overlays
+  if (S.gameOver) {
+    ctx.fillStyle = 'rgba(0,0,0,0.7)';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle = '#ff6060';
+    ctx.font = '500 36px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Game Over', canvas.width/2, canvas.height/2 - 20);
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.font = '14px sans-serif';
+    ctx.fillText('Press R to restart', canvas.width/2, canvas.height/2+20);
+    ctx.textAlign = 'left';
+  }
+
+  // minimap
+  drawMinimap(camX, camY);
+}
+
+function drawMinimap(camX, camY) {
+  const mw = 120, mh = 120;
+  mm.fillStyle = '#0a0a0f';
+  mm.fillRect(0,0,mw,mh);
+  const sx = mw/COLS, sy = mh/ROWS;
+  for (let y = 0; y < ROWS; y++) {
+    for (let x = 0; x < COLS; x++) {
+      if (S.map[y][x] === 0) {
+        mm.fillStyle = '#222245';
+        mm.fillRect(x*sx, y*sy, sx, sy);
+      }
+    }
+  }
+  // exit
+  mm.fillStyle = '#4af';
+  mm.fillRect(S.exit.x*sx-1, S.exit.y*sy-1, 3, 3);
+  // players
+  for (const p of S.players) {
+    if (!p.alive) continue;
+    mm.fillStyle = p.color;
+    mm.fillRect(p.x/TILE*sx-1, p.y/TILE*sy-1, 3, 3);
+  }
+}
+
+function loop() {
+  update();
+  draw();
+  animId = requestAnimationFrame(loop);
+}
+
+window.startGame = startGame;
+</script>
+</body>
+</html>
